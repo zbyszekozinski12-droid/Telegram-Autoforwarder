@@ -1,22 +1,23 @@
 # server.py
-import os, time, threading
+import os
+import time
+import threading
+import asyncio
+
 from fastapi import FastAPI
 import uvicorn
 
+import TelegramForwarder  # notre script ci-dessus
+
+
 def run_bot():
-    import TelegramForwarder
-    if hasattr(TelegramForwarder, "main"):
-        TelegramForwarder.main()
-    else:
-        # fallback si pas de main()
-        from TelegramForwarder import build_client
-        c = build_client()
-        c.start()
-        c.run_until_disconnected()
+    asyncio.run(TelegramForwarder.main())
+
 
 app = FastAPI()
+
 @app.get("/")
-def ok():
+def health():
     return {"ok": True, "t": int(time.time())}
 
 if __name__ == "__main__":
