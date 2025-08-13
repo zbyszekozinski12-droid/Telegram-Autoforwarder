@@ -1,4 +1,3 @@
-# server.py
 import os
 import time
 import threading
@@ -7,7 +6,7 @@ import asyncio
 from fastapi import FastAPI
 import uvicorn
 
-import TelegramForwarder  # notre script ci-dessus
+import TelegramForwarder  # le fichier ci-dessus
 
 
 def run_bot():
