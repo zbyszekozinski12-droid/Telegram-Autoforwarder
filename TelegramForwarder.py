@@ -1,5 +1,4 @@
 import os
-import time
 import asyncio
 from typing import List, Optional
 
@@ -13,16 +12,17 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-MODE = os.getenv("MODE", "forward").strip().lower()  # "forward" ou "list"
+MODE = os.getenv("MODE", "forward").strip().lower()  # "forward" (écoute) ou "list" (lister les chats)
 
 SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")
 DESTINATION_CHAT_ID = os.getenv("DESTINATION_CHAT_ID")
 KEYWORDS_RAW = os.getenv("KEYWORDS", "")            # ex: "mot1,mot2"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
-# Fallback: si un média ne peut pas être renvoyé (p. ex. contenu protégé),
-# envoyer un lien vers le message original ? "1" = oui, "0" = non
-USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")
+# Repost-only (pas de forward natif, donc pas de "forwarded from")
+ALWAYS_REPOST = os.getenv("ALWAYS_REPOST", "1")  # "1" = toujours repost (recommandé)
+# Si un média ne peut pas être renvoyé (ex: contenu protégé), envoyer aussi un lien ?
+USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")  # "1" oui, "0" non
 
 # Optionnel pour usage local (pas Render)
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
@@ -82,9 +82,8 @@ class TelegramForwarder:
     async def _send_media_piece(self, dest_id: int, m: Message, caption: Optional[str]):
         """
         Envoie UNE pièce média avec le meilleur type pour avoir l'aperçu.
-        Ne contourne pas la protection : si Telethon/Telegram refuse, on lève et l'appelant gère.
         """
-        # Priorité à photo/vidéo pour gardez la preview/lecteur natif
+        # Priorité à photo/vidéo pour garder la preview/lecteur natif
         if getattr(m, "photo", None):
             await self.client.send_file(dest_id, m.photo, caption=caption, link_preview=False)
             return
@@ -92,25 +91,24 @@ class TelegramForwarder:
             await self.client.send_file(dest_id, m.video, caption=caption, link_preview=False, supports_streaming=True)
             return
         if getattr(m, "document", None):
-            # Peut être image envoyée en "document", pdf, zip, etc.
+            # Peut être image envoyée en "document", pdf, zip, audio/voix, etc.
             await self.client.send_file(dest_id, m.document, caption=caption, link_preview=False)
             return
-        # Pas de média reconnu -> on tente juste le texte si présent
+        # Pas de media reconnu -> texte seul si présent
         if caption:
             await self.client.send_message(dest_id, caption, link_preview=False)
 
     async def _repost_message(self, m: Message, dest_id: int):
         """
-        Reposte texte + médias (photos/vidéos/docs) avec la légende si présente.
-        Gère aussi les albums avec preview. Si l'envoi média échoue (ex: contenu protégé),
-        envoie le texte, et éventuellement un lien vers l'original si USE_LINK_ON_PROTECTED = "1".
+        Reposte texte + médias (photos/vidéos/docs/vocaux) avec la légende si présente.
+        Gère aussi les albums. Ne contourne PAS la protection : si envoi impossible,
+        on bascule sur texte (+ lien si USE_LINK_ON_PROTECTED = "1").
         """
         text = (m.message or "")
         caption = text.strip() or None
 
         # ---- Albums (messages groupés) ----
         if getattr(m, "grouped_id", None):
-            # Récupérer les pièces de l'album proches
             pieces: List[Message] = []
             for delta in range(0, 20):
                 a = await self.client.get_messages(m.chat_id, ids=m.id + delta)
@@ -119,7 +117,6 @@ class TelegramForwarder:
                 pieces.append(a)
 
             if pieces:
-                # Envoi groupé : on convertit chaque pièce en "media object"
                 media_objs = []
                 for a in pieces:
                     if getattr(a, "photo", None):
@@ -131,13 +128,14 @@ class TelegramForwarder:
 
                 if media_objs:
                     try:
-                        await self.client.send_file(dest_id, media_objs, caption=caption, link_preview=False, supports_streaming=True)
+                        await self.client.send_file(
+                            dest_id, media_objs, caption=caption, link_preview=False, supports_streaming=True
+                        )
                         return
-                    except Exception as e:
-                        # Échec (ex: contenu protégé, taille, etc.) -> fallback
-                        pass
+                    except Exception:
+                        pass  # fallback
 
-            # Fallback album: texte + (lien)
+            # Fallback album
             if caption:
                 await self.client.send_message(dest_id, caption, link_preview=False)
             if USE_LINK_ON_PROTECTED == "1":
@@ -177,11 +175,9 @@ class TelegramForwarder:
                 send_it = True if not keywords else any(k in msg_text.lower() for k in keywords)
 
                 if send_it:
-                    # Si le forward NATIF est autorisé par la source, tu peux utiliser ceci :
-                    # await self.client.forward_messages(destination_chat_id, m)
-                    # Sinon, on "repost" pour avoir la preview des médias
+                    # Repost uniquement (pas de "forwarded from")
                     await self._repost_message(m, destination_chat_id)
-                    print(f"Transféré: {m.id}")
+                    print(f"Transféré (repost): {m.id}")
 
                 last_id = max(last_id, m.id)
 
@@ -208,3 +204,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
