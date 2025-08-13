@@ -3,42 +3,43 @@ import time
 import asyncio
 from typing import List, Optional
 
-from telethon import errors
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
+from telethon.tl.types import Message
 
 
-# ---------- Config via variables d'environnement ----------
-# OBLIGATOIRES
+# ========= Config via variables d'environnement =========
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-# SESSION_STRING = login sans interaction (génère-le une fois en local, puis colle-le dans Render)
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-# MODE : "forward" (par défaut) ou "list"
-MODE = os.getenv("MODE", "forward").strip().lower()
+MODE = os.getenv("MODE", "forward").strip().lower()  # "forward" ou "list"
 
-# Paramètres du mode "forward"
-SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")   # ex: -100123456789
-DESTINATION_CHAT_ID = os.getenv("DESTINATION_CHAT_ID")  # ex: -100987654321
-KEYWORDS_RAW = os.getenv("KEYWORDS", "")  # ex: mot1,mot2
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # secondes
+SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")
+DESTINATION_CHAT_ID = os.getenv("DESTINATION_CHAT_ID")
+KEYWORDS_RAW = os.getenv("KEYWORDS", "")            # ex: "mot1,mot2"
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")  # "1" pour envoyer un lien si média protégé
 
-# Optionnel (utile seulement en local)
+# Optionnel pour usage local (pas Render)
 PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
 
 
 def build_client() -> TelegramClient:
-    """
-    Crée le client Telethon sans interaction si SESSION_STRING est défini.
-    """
     if not API_ID or not API_HASH:
-        raise RuntimeError("API_ID/API_HASH manquants (variables d'environnement).")
-
+        raise RuntimeError("API_ID/API_HASH manquants.")
     if SESSION_STRING:
         return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    # Fallback (local uniquement : demandera un code SMS). À éviter sur Render.
+    # Fallback local (évite pour Render)
     return TelegramClient("anon", API_ID, API_HASH)
+
+
+def build_private_link(chat_id: int, msg_id: int) -> str:
+    # Lien vers message privé (visible par les membres du canal/groupe)
+    cid = str(chat_id)
+    if cid.startswith("-100"):
+        cid = cid[4:]
+    return f"https://t.me/c/{cid}/{msg_id}"
 
 
 class TelegramForwarder:
@@ -46,16 +47,11 @@ class TelegramForwarder:
         self.client = client
 
     async def ensure_login(self):
-        """
-        Si SESSION_STRING est fourni, client.start() ne demandera rien.
-        Sans SESSION_STRING, on tente un login interactif (local).
-        """
         await self.client.connect()
         if not await self.client.is_user_authorized():
             if not PHONE_NUMBER:
                 raise RuntimeError(
-                    "Non autorisé et pas de SESSION_STRING. "
-                    "Fournis SESSION_STRING (recommandé pour Render)."
+                    "Non autorisé et pas de SESSION_STRING. Fournis SESSION_STRING (recommandé pour Render)."
                 )
             await self.client.send_code_request(PHONE_NUMBER)
             try:
@@ -78,14 +74,63 @@ class TelegramForwarder:
 
     @staticmethod
     def parse_keywords(raw: str) -> List[str]:
-        if not raw:
-            return []
-        return [k.strip().lower() for k in raw.split(",") if k.strip()]
+        return [k.strip().lower() for k in raw.split(",") if k.strip()] if raw else []
 
-    async def forward_messages(self, source_chat_id: int, destination_chat_id: int, keywords: Optional[List[str]]):
+    async def _repost_message(self, m: Message, dest_id: int):
+        """
+        Reposte texte + médias (photos/vidéos/docs) avec la légende si présente.
+        Gère les albums. Ne contourne PAS la protection : si média protégé, download_media renverra None.
+        """
+        text = (m.message or "")
+        caption = text.strip() or None
+
+        # Albums (messages groupés)
+        if getattr(m, "grouped_id", None):
+            files = []
+            # simple balayage autour pour récupérer les pièces de l'album
+            for delta in range(0, 20):
+                a = await self.client.get_messages(m.chat_id, ids=m.id + delta)
+                if not a:
+                    continue
+                if getattr(a, "grouped_id", None) != m.grouped_id:
+                    continue
+                if a.media:
+                    data = await a.download_media(file=bytes)
+                    if data is not None:
+                        files.append(data)
+            if files:
+                await self.client.send_file(dest_id, files, caption=caption, link_preview=False)
+            else:
+                # album protégé : on n'a pas les fichiers
+                if caption:
+                    await self.client.send_message(dest_id, caption, link_preview=False)
+                if USE_LINK_ON_PROTECTED == "1":
+                    link = build_private_link(m.chat_id, m.id)
+                    await self.client.send_message(dest_id, f"[Voir le message d’origine]({link})", link_preview=False)
+            return
+
+        # Média unique
+        if m.media:
+            data = await m.download_media(file=bytes)
+            if data is not None:
+                await self.client.send_file(dest_id, data, caption=caption, link_preview=False)
+            else:
+                # Média protégé/non téléchargeable
+                if caption:
+                    await self.client.send_message(dest_id, caption, link_preview=False)
+                if USE_LINK_ON_PROTECTED == "1":
+                    link = build_private_link(m.chat_id, m.id)
+                    await self.client.send_message(dest_id, f"[Voir le message d’origine]({link})", link_preview=False)
+            return
+
+        # Texte seul
+        if text:
+            await self.client.send_message(dest_id, text, link_preview=False)
+
+    async def forward_loop(self, source_chat_id: int, destination_chat_id: int, keywords: Optional[List[str]]):
         await self.ensure_login()
 
-        # Dernier message existant pour éviter de re-forward l'historique
+        # Point de départ pour éviter de re-poster l'historique
         last = await self.client.get_messages(source_chat_id, limit=1)
         last_id = last[0].id if last else 0
 
@@ -93,28 +138,29 @@ class TelegramForwarder:
         while True:
             msgs = await self.client.get_messages(source_chat_id, min_id=last_id, limit=None)
             for m in reversed(msgs):
-                text = (m.text or "")  # peut être None
-                if not keywords:
-                    await self.client.send_message(destination_chat_id, text)
-                    print(f"[FORWARD] {m.id}")
-                else:
-                    low = text.lower()
-                    if any(k in low for k in keywords):
-                        await self.client.send_message(destination_chat_id, text)
-                        print(f"[FORWARD MATCH] {m.id} -> '{text[:60]}'")
+                msg_text = (m.message or "")
+                send_it = True if not keywords else any(k in msg_text.lower() for k in keywords)
+
+                if send_it:
+                    # Si le forward NATUREL est permis par le canal source, tu peux utiliser :
+                    # await self.client.forward_messages(destination_chat_id, m)
+                    # Sinon, on repost (texte + médias)
+                    await self._repost_message(m, destination_chat_id)
+                    print(f"Transféré: {m.id}")
+
                 last_id = max(last_id, m.id)
+
             await asyncio.sleep(POLL_INTERVAL)
 
 
 async def main():
     client = build_client()
-    forwarder = TelegramForwarder(client)
+    fwd = TelegramForwarder(client)
 
     if MODE == "list":
-        await forwarder.list_chats()
+        await fwd.list_chats()
         return
 
-    # MODE forward par défaut
     if SOURCE_CHAT_ID is None or DESTINATION_CHAT_ID is None:
         raise RuntimeError("SOURCE_CHAT_ID et DESTINATION_CHAT_ID sont requis en mode 'forward'.")
 
@@ -122,7 +168,7 @@ async def main():
     dest = int(DESTINATION_CHAT_ID)
     keywords = TelegramForwarder.parse_keywords(KEYWORDS_RAW)
 
-    await forwarder.forward_messages(source, dest, keywords)
+    await fwd.forward_loop(source, dest, keywords)
 
 
 if __name__ == "__main__":
