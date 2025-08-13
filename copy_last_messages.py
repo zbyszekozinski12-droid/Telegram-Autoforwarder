@@ -6,7 +6,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
 API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", ""))
+API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 SOURCE_CHAT_ID = int(os.getenv("SOURCE_CHAT_ID", "0"))
 DESTINATION_CHAT_ID = int(os.getenv("DESTINATION_CHAT_ID", "0"))
