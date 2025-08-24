@@ -6,26 +6,24 @@ from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
-
-# ========= Config via variables d'environnement =========
+# ========= Variables d'environnement =========
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-MODE = os.getenv("MODE", "forward").strip().lower()  # "forward" (écoute) ou "list" (lister les chats)
-
+MODE = os.getenv("MODE", "forward").strip().lower()  # "forward" ou "list"
 SOURCE_CHAT_ID = os.getenv("SOURCE_CHAT_ID")
 DESTINATION_CHAT_ID = os.getenv("DESTINATION_CHAT_ID")
-KEYWORDS_RAW = os.getenv("KEYWORDS", "")            # ex: "mot1,mot2"
+KEYWORDS_RAW = os.getenv("KEYWORDS", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
-# Repost-only (pas de forward natif, donc pas de "forwarded from")
-ALWAYS_REPOST = os.getenv("ALWAYS_REPOST", "1")  # "1" = toujours repost (recommandé)
-# Si un média ne peut pas être renvoyé (ex: contenu protégé), envoyer aussi un lien ?
-USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")  # "1" oui, "0" non
+ALWAYS_REPOST = os.getenv("ALWAYS_REPOST", "1")  # "1" = pas de forward natif
+USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")  # "1" = lien si média bloqué
 
-# Optionnel pour usage local (pas Render)
-PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")  # optionnel
+
+# état de connexion (utilisé par /healthz dans server.py)
+is_connected: bool = False
 
 
 def build_client() -> TelegramClient:
@@ -33,12 +31,10 @@ def build_client() -> TelegramClient:
         raise RuntimeError("API_ID/API_HASH manquants.")
     if SESSION_STRING:
         return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    # Fallback local (évite pour Render)
     return TelegramClient("anon", API_ID, API_HASH)
 
 
 def build_private_link(chat_id: int, msg_id: int) -> str:
-    """Lien vers message privé (visible par les membres du canal/groupe)."""
     cid = str(chat_id)
     if cid.startswith("-100"):
         cid = cid[4:]
@@ -50,40 +46,35 @@ class TelegramForwarder:
         self.client = client
 
     async def ensure_login(self):
+        global is_connected
         await self.client.connect()
         if not await self.client.is_user_authorized():
             if not PHONE_NUMBER:
-                raise RuntimeError(
-                    "Non autorisé et pas de SESSION_STRING. Fournis SESSION_STRING (recommandé pour Render)."
-                )
+                raise RuntimeError("Pas de SESSION_STRING et pas de PHONE_NUMBER")
             await self.client.send_code_request(PHONE_NUMBER)
             try:
                 code = input("Enter the code: ")
                 await self.client.sign_in(PHONE_NUMBER, code)
             except errors.rpcerrorlist.SessionPasswordNeededError:
-                password = input("Two-step verification is enabled. Enter your password: ")
+                password = input("Enter 2FA password: ")
                 await self.client.sign_in(password=password)
+        is_connected = True
 
     async def list_chats(self):
         await self.ensure_login()
         dialogs = await self.client.get_dialogs()
-        filename = "chats_list.txt"
-        with open(filename, "w", encoding="utf-8") as f:
+        with open("chats_list.txt", "w", encoding="utf-8") as f:
             for d in dialogs:
                 line = f"Chat ID: {d.id}, Title: {d.title}\n"
                 print(line, end="")
                 f.write(line)
-        print(f"Liste des chats sauvegardée dans {filename}")
+        print("Chats list saved to chats_list.txt")
 
     @staticmethod
     def parse_keywords(raw: str) -> List[str]:
         return [k.strip().lower() for k in raw.split(",") if k.strip()] if raw else []
 
     async def _send_media_piece(self, dest_id: int, m: Message, caption: Optional[str]):
-        """
-        Envoie UNE pièce média avec le meilleur type pour avoir l'aperçu.
-        """
-        # Priorité à photo/vidéo pour garder la preview/lecteur natif
         if getattr(m, "photo", None):
             await self.client.send_file(dest_id, m.photo, caption=caption, link_preview=False)
             return
@@ -91,23 +82,16 @@ class TelegramForwarder:
             await self.client.send_file(dest_id, m.video, caption=caption, link_preview=False, supports_streaming=True)
             return
         if getattr(m, "document", None):
-            # Peut être image envoyée en "document", pdf, zip, audio/voix, etc.
             await self.client.send_file(dest_id, m.document, caption=caption, link_preview=False)
             return
-        # Pas de media reconnu -> texte seul si présent
         if caption:
             await self.client.send_message(dest_id, caption, link_preview=False)
 
     async def _repost_message(self, m: Message, dest_id: int):
-        """
-        Reposte texte + médias (photos/vidéos/docs/vocaux) avec la légende si présente.
-        Gère aussi les albums. Ne contourne PAS la protection : si envoi impossible,
-        on bascule sur texte (+ lien si USE_LINK_ON_PROTECTED = "1").
-        """
         text = (m.message or "")
         caption = text.strip() or None
 
-        # ---- Albums (messages groupés) ----
+        # Albums
         if getattr(m, "grouped_id", None):
             pieces: List[Message] = []
             for delta in range(0, 20):
@@ -129,59 +113,75 @@ class TelegramForwarder:
                 if media_objs:
                     try:
                         await self.client.send_file(
-                            dest_id, media_objs, caption=caption, link_preview=False, supports_streaming=True
+                            dest_id, media_objs, caption=caption,
+                            link_preview=False, supports_streaming=True
                         )
                         return
                     except Exception:
-                        pass  # fallback
+                        pass
 
-            # Fallback album
+            # fallback album
             if caption:
                 await self.client.send_message(dest_id, caption, link_preview=False)
             if USE_LINK_ON_PROTECTED == "1":
                 link = build_private_link(m.chat_id, m.id)
-                await self.client.send_message(dest_id, f"[Voir le message d’origine]({link})", link_preview=False)
+                await self.client.send_message(dest_id, f"[Voir l’original]({link})", link_preview=False)
             return
 
-        # ---- Média unique ----
+        # Média unique
         if m.media:
             try:
                 await self._send_media_piece(dest_id, m, caption)
             except Exception:
-                # Échec média -> fallback texte + (lien)
                 if caption:
                     await self.client.send_message(dest_id, caption, link_preview=False)
                 if USE_LINK_ON_PROTECTED == "1":
                     link = build_private_link(m.chat_id, m.id)
-                    await self.client.send_message(dest_id, f"[Voir le message d’origine]({link})", link_preview=False)
+                    await self.client.send_message(dest_id, f"[Voir l’original]({link})", link_preview=False)
             return
 
-        # ---- Texte seul ----
+        # Texte seul
         if text:
             await self.client.send_message(dest_id, text, link_preview=False)
 
     async def forward_loop(self, source_chat_id: int, destination_chat_id: int, keywords: Optional[List[str]]):
+        global is_connected
         await self.ensure_login()
 
-        # Point de départ pour éviter de re-poster l'historique
         last = await self.client.get_messages(source_chat_id, limit=1)
         last_id = last[0].id if last else 0
 
+        processed_albums = set()  # éviter doublons
+
         print("Bot démarré. Surveillance en cours…")
         while True:
-            msgs = await self.client.get_messages(source_chat_id, min_id=last_id, limit=None)
-            for m in reversed(msgs):
-                msg_text = (m.message or "")
-                send_it = True if not keywords else any(k in msg_text.lower() for k in keywords)
+            try:
+                msgs = await self.client.get_messages(source_chat_id, min_id=last_id, limit=None)
+                for m in reversed(msgs):
+                    msg_text = (m.message or "")
+                    send_it = True if not keywords else any(k in msg_text.lower() for k in keywords)
 
-                if send_it:
-                    # Repost uniquement (pas de "forwarded from")
-                    await self._repost_message(m, destination_chat_id)
-                    print(f"Transféré (repost): {m.id}")
+                    gid = getattr(m, "grouped_id", None)
+                    if gid is not None and gid in processed_albums:
+                        last_id = max(last_id, m.id)
+                        continue
 
-                last_id = max(last_id, m.id)
+                    if send_it:
+                        if gid is not None:
+                            processed_albums.add(gid)
+                        await self._repost_message(m, destination_chat_id)
+                        print(f"Transféré (repost): {m.id}")
 
-            await asyncio.sleep(POLL_INTERVAL)
+                    last_id = max(last_id, m.id)
+
+                processed_albums.clear()
+                is_connected = True
+                await asyncio.sleep(POLL_INTERVAL)
+
+            except Exception as e:
+                is_connected = False
+                print(f"[loop] error: {e}. retry in 3s")
+                await asyncio.sleep(3)
 
 
 async def main():
@@ -193,7 +193,7 @@ async def main():
         return
 
     if SOURCE_CHAT_ID is None or DESTINATION_CHAT_ID is None:
-        raise RuntimeError("SOURCE_CHAT_ID et DESTINATION_CHAT_ID sont requis en mode 'forward'.")
+        raise RuntimeError("SOURCE_CHAT_ID et DESTINATION_CHAT_ID manquants.")
 
     source = int(SOURCE_CHAT_ID)
     dest = int(DESTINATION_CHAT_ID)
@@ -204,4 +204,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
