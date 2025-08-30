@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from typing import List, Optional
 
@@ -17,13 +18,39 @@ DESTINATION_CHAT_ID = os.getenv("DESTINATION_CHAT_ID")
 KEYWORDS_RAW = os.getenv("KEYWORDS", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
-ALWAYS_REPOST = os.getenv("ALWAYS_REPOST", "1")  # "1" = pas de forward natif
-USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")  # "1" = lien si média bloqué
+# Repost-only (pas de forward natif)
+ALWAYS_REPOST = os.getenv("ALWAYS_REPOST", "1")  # gardé pour compat
+# Lien fallback si média protégé/inaccessible
+USE_LINK_ON_PROTECTED = os.getenv("USE_LINK_ON_PROTECTED", "1")
 
-PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")  # optionnel
+# Remplacement auto de handle
+HANDLE_FROM = os.getenv("HANDLE_FROM", "@mrhugobossai")
+HANDLE_TO   = os.getenv("HANDLE_TO",   "@mrhugobosai")
+REWRITE_LINKS = os.getenv("REWRITE_LINKS", "1") == "1"
 
-# état de connexion (utilisé par /healthz dans server.py)
+# Optionnel pour run local (pas Render)
+PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
+
+# État connexion (utilisé par /healthz dans server.py)
 is_connected: bool = False
+
+
+# ---------- helpers ----------
+_handle_pat = re.compile(r'(?i)@?' + re.escape(HANDLE_FROM.lstrip('@')) + r'\b')
+_link_pat   = re.compile(r'(?i)(https?://)?(t\.me|telegram\.me)/' + re.escape(HANDLE_FROM.lstrip('@')) + r'\b')
+
+def _rewrite_handles(text: Optional[str]) -> Optional[str]:
+    """Remplace @mrhugobossai -> @mrhugobosai (+ liens t.me) dans tout texte/caption."""
+    if not text:
+        return text
+    new = _handle_pat.sub(HANDLE_TO, text)
+    if REWRITE_LINKS:
+        def _repl(m):
+            prefix = m.group(1) or ''
+            domain = m.group(2)
+            return f"{prefix}{domain}/{HANDLE_TO.lstrip('@')}"
+        new = _link_pat.sub(_repl, new)
+    return new
 
 
 def build_client() -> TelegramClient:
@@ -75,23 +102,28 @@ class TelegramForwarder:
         return [k.strip().lower() for k in raw.split(",") if k.strip()] if raw else []
 
     async def _send_media_piece(self, dest_id: int, m: Message, caption: Optional[str]):
+        """Envoie UNE pièce média avec preview quand possible (photo/vidéo/doc/vocal)."""
+        cap = _rewrite_handles(caption)
+
+        # Priorité photo/vidéo (preview/lecteur natif)
         if getattr(m, "photo", None):
-            await self.client.send_file(dest_id, m.photo, caption=caption, link_preview=False)
+            await self.client.send_file(dest_id, m.photo, caption=cap, link_preview=False)
             return
         if getattr(m, "video", None):
-            await self.client.send_file(dest_id, m.video, caption=caption, link_preview=False, supports_streaming=True)
+            await self.client.send_file(dest_id, m.video, caption=cap, link_preview=False, supports_streaming=True)
             return
         if getattr(m, "document", None):
-            await self.client.send_file(dest_id, m.document, caption=caption, link_preview=False)
+            await self.client.send_file(dest_id, m.document, caption=cap, link_preview=False)
             return
-        if caption:
-            await self.client.send_message(dest_id, caption, link_preview=False)
+        if cap:
+            await self.client.send_message(dest_id, cap, link_preview=False)
 
     async def _repost_message(self, m: Message, dest_id: int):
+        """Reposte texte + médias (albums inclus). Pas de contournement contenu protégé."""
         text = (m.message or "")
         caption = text.strip() or None
 
-        # Albums
+        # ---- Albums (messages groupés) ----
         if getattr(m, "grouped_id", None):
             pieces: List[Message] = []
             for delta in range(0, 20):
@@ -109,55 +141,57 @@ class TelegramForwarder:
                         media_objs.append(a.video)
                     elif getattr(a, "document", None):
                         media_objs.append(a.document)
-
                 if media_objs:
                     try:
                         await self.client.send_file(
-                            dest_id, media_objs, caption=caption,
+                            dest_id, media_objs, caption=_rewrite_handles(caption),
                             link_preview=False, supports_streaming=True
                         )
                         return
                     except Exception:
-                        pass
+                        pass  # fallback album
 
-            # fallback album
+            # Fallback album
             if caption:
-                await self.client.send_message(dest_id, caption, link_preview=False)
+                await self.client.send_message(dest_id, _rewrite_handles(caption), link_preview=False)
             if USE_LINK_ON_PROTECTED == "1":
                 link = build_private_link(m.chat_id, m.id)
                 await self.client.send_message(dest_id, f"[Voir l’original]({link})", link_preview=False)
             return
 
-        # Média unique
+    # ---- Média unique ----
         if m.media:
             try:
                 await self._send_media_piece(dest_id, m, caption)
             except Exception:
+                # Fallback texte + (lien)
                 if caption:
-                    await self.client.send_message(dest_id, caption, link_preview=False)
+                    await self.client.send_message(dest_id, _rewrite_handles(caption), link_preview=False)
                 if USE_LINK_ON_PROTECTED == "1":
                     link = build_private_link(m.chat_id, m.id)
                     await self.client.send_message(dest_id, f"[Voir l’original]({link})", link_preview=False)
             return
 
-        # Texte seul
+        # ---- Texte seul ----
         if text:
-            await self.client.send_message(dest_id, text, link_preview=False)
+            await self.client.send_message(dest_id, _rewrite_handles(text), link_preview=False)
 
     async def forward_loop(self, source_chat_id: int, destination_chat_id: int, keywords: Optional[List[str]]):
+        """Boucle résiliente + anti-doublons d'albums."""
         global is_connected
         await self.ensure_login()
 
         last = await self.client.get_messages(source_chat_id, limit=1)
         last_id = last[0].id if last else 0
 
-        processed_albums = set()  # éviter doublons
+        processed_albums = set()  # grouped_id déjà envoyés (évite doublons)
 
         print("Bot démarré. Surveillance en cours…")
         while True:
             try:
                 msgs = await self.client.get_messages(source_chat_id, min_id=last_id, limit=None)
-                for m in reversed(msgs):
+
+                for m in reversed(msgs):  # du plus ancien au plus récent
                     msg_text = (m.message or "")
                     send_it = True if not keywords else any(k in msg_text.lower() for k in keywords)
 
