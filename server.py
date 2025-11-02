@@ -16,26 +16,26 @@ def run_bot_resilient():
         try:
             asyncio.run(TelegramForwarder.main())
         except Exception as e:
-            print(f"[bot] crashed: {e}. restarting in 5s...")
+            print(f"[bot] crashed: {e}. Restarting in 5s...")
             time.sleep(5)
         else:
-            print("[bot] main() returned. restarting in 5s...")
+            print("[bot] main() returned. Restarting in 5s...")
             time.sleep(5)
 
 # --- Fonction keep-alive pour éviter que Render mette le container en veille ---
 def keep_alive():
     url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', '')}/"
     while True:
-        try:
-            if url and url != "https://":
+        if url and url != "https://":
+            try:
                 requests.get(url, timeout=10)
                 print("[keep-alive] Ping envoyé ✅")
-        except Exception as e:
-            print(f"[keep-alive] Erreur : {e}")
+            except Exception as e:
+                print(f"[keep-alive] Erreur : {e}")
         time.sleep(600)  # toutes les 10 minutes
 
 # --- FastAPI ---
-app = FastAPI()
+app = FastAPI(title="Telegram Autoforwarder API")
 
 # --- Health simple (GET) ---
 @app.get("/")
@@ -50,19 +50,13 @@ def health_head(request: Request):
 # --- Health avancé (GET) : indique si le bot est connecté à Telegram ---
 @app.get("/healthz")
 def healthz_get():
-    try:
-        connected = bool(TelegramForwarder.is_connected)
-    except Exception:
-        connected = False
+    connected = getattr(TelegramForwarder, "is_connected", False)
     return {"ok": True, "connected": connected, "t": int(time.time())}
 
 # --- Health avancé (HEAD) pour UptimeRobot gratuit ---
 @app.head("/healthz")
 def healthz_head(request: Request):
-    try:
-        connected = bool(TelegramForwarder.is_connected)
-    except Exception:
-        connected = False
+    connected = getattr(TelegramForwarder, "is_connected", False)
     return JSONResponse(content={"ok": True, "connected": connected, "t": int(time.time())})
 
 # --- Lancement du bot et du serveur ---
